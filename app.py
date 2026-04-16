@@ -509,7 +509,7 @@ if cas_list and st.button("🔍 MSDS 정보 추출 시작", type="primary"):
                 "제품명": r["product_name"],
                 "Cat. No.": r["catalog_number"],
                 "CAS No. (확인)": r["cas_number"],
-                "외관": r["appearance"],
+                "성상": r["appearance"],
                 "보관 조건": r["storage"],
                 "가격 (용량/$)": r["prices"],
                 "상태": r["status"],
@@ -521,7 +521,7 @@ if cas_list and st.button("🔍 MSDS 정보 추출 시작", type="primary"):
 
     # ---- 출력 Excel 구성 (헤더 행 포함) ----
     header = ["CAS No.", "제품명 (Product Name)", "Cat. No.", "CAS No. (확인)",
-              "외관 (Appearance)", "보관 조건", "가격 (용량/$)"]
+              "성상 (Appearance)", "보관 조건", "가격 (용량/$)"]
 
     rows = []
     for r in results:
