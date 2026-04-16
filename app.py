@@ -460,7 +460,6 @@ edited_df = st.data_editor(
         "CAS No.": st.column_config.TextColumn(
             "CAS No.",
             help="CAS 번호를 입력하세요 (예: 3952-78-1)",
-            placeholder="예) 3952-78-1",
         )
     },
     hide_index=True,
