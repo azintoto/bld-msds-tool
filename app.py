@@ -430,118 +430,125 @@ def process_cas(cas: str, session: requests.Session) -> dict:
 
 st.title("🧪 BLD Pharm MSDS 정보 추출기")
 st.markdown(
-    "Excel 파일 A열의 CAS 번호로 [bldpharm.com](https://www.bldpharm.com/) SDS를 "
-    "자동 다운로드하고, 아래 정보를 B~G열에 저장합니다.\n\n"
-    "| 열 | 내용 |\n|---|---|\n"
-    "| B | Product Name |\n"
-    "| C | Catalog Number |\n"
-    "| D | CAS Number |\n"
-    "| E | Appearance |\n"
-    "| F | 보관 조건 (상온 / 냉장 / 냉동) |\n"
-    "| G | Price by volume (예: 1g/$11, 5g/$31) |"
+    "CAS 번호를 아래 표에 직접 입력하면 [bldpharm.com](https://www.bldpharm.com/) "
+    "SDS를 자동 검색하여 제품명, 보관조건, 가격 등을 추출합니다."
 )
 
 st.divider()
 
-uploaded = st.file_uploader(
-    "Excel 파일 업로드 (A열: CAS 번호)",
-    type=["xlsx", "xls"],
-    help="예) A1=3952-78-1, A2=...",
+# ---------------------------------------------------------------------------
+# CAS 번호 입력 테이블
+# ---------------------------------------------------------------------------
+
+st.subheader("CAS 번호 입력")
+st.caption("아래 표의 CAS No. 열에 CAS 번호를 입력하세요 (형식 예: 3952-78-1). 행은 자유롭게 추가할 수 있습니다.")
+
+# 기본 행 수 슬라이더
+default_rows = st.number_input("입력할 시약 수", min_value=1, max_value=100, value=5, step=1)
+
+# 세션 상태에 편집 테이블 유지
+if "cas_table" not in st.session_state or len(st.session_state.cas_table) != default_rows:
+    st.session_state.cas_table = pd.DataFrame(
+        {"CAS No.": [""] * int(default_rows)}
+    )
+
+edited_df = st.data_editor(
+    st.session_state.cas_table,
+    use_container_width=True,
+    num_rows="dynamic",
+    column_config={
+        "CAS No.": st.column_config.TextColumn(
+            "CAS No.",
+            help="CAS 번호를 입력하세요 (예: 3952-78-1)",
+            placeholder="예) 3952-78-1",
+        )
+    },
+    hide_index=True,
+    key="cas_editor",
 )
 
-if uploaded:
-    file_bytes = uploaded.read()
+# 유효한 CAS 번호 추출
+cas_re = re.compile(r"^\d{1,7}-\d{2}-\d$")
+cas_list = [
+    str(v).strip()
+    for v in edited_df["CAS No."].fillna("")
+    if cas_re.match(str(v).strip())
+]
 
-    try:
-        df_orig = pd.read_excel(BytesIO(file_bytes), header=None, dtype=str)
-    except Exception as e:
-        st.error(f"파일 읽기 오류: {e}")
-        st.stop()
+if cas_list:
+    st.info(f"유효한 CAS 번호 **{len(cas_list)}**개 인식됨: {', '.join(cas_list)}")
+else:
+    st.warning("유효한 CAS 번호가 없습니다. 위 표에 CAS 번호를 입력해 주세요.")
 
-    cas_re = re.compile(r"^\d{1,7}-\d{2}-\d$")
-    col_a = df_orig.iloc[:, 0].fillna("")
-    row_indices = [i for i, v in enumerate(col_a) if cas_re.match(str(v).strip())]
-    cas_list = [str(col_a.iloc[i]).strip() for i in row_indices]
+st.divider()
 
-    if not cas_list:
-        st.warning(
-            "유효한 CAS 번호를 찾지 못했습니다. "
-            "A열에 CAS 번호를 입력하세요 (형식 예: 3952-78-1)."
+if cas_list and st.button("🔍 MSDS 정보 추출 시작", type="primary"):
+    session = make_session()
+    results: list[dict] = []
+
+    prog_bar = st.progress(0, text="시작 중...")
+    status_msg = st.empty()
+
+    for i, cas in enumerate(cas_list):
+        status_msg.info(f"[{i + 1}/{len(cas_list)}] CAS **{cas}** 처리 중...")
+        result = process_cas(cas, session)
+        results.append(result)
+        prog_bar.progress(
+            (i + 1) / len(cas_list),
+            text=f"{i + 1}/{len(cas_list)} — {cas}: {result['status']}",
         )
-        st.stop()
+        time.sleep(0.4)
 
-    st.success(f"총 **{len(cas_list)}**개의 CAS 번호를 찾았습니다.")
-    with st.expander("CAS 번호 목록 확인"):
-        st.write(cas_list)
+    n_ok = sum(1 for r in results if r["status"] == "성공")
+    status_msg.success(f"완료! 성공 {n_ok} / 전체 {len(results)}개")
 
-    if st.button("🔍 MSDS 정보 추출 시작", type="primary"):
-        session = make_session()
-        results: list[dict] = []
+    # ---- 결과 테이블 표시 ----
+    display_df = pd.DataFrame(
+        [
+            {
+                "CAS No. (입력)": r["input_cas"],
+                "제품명": r["product_name"],
+                "Cat. No.": r["catalog_number"],
+                "CAS No. (확인)": r["cas_number"],
+                "외관": r["appearance"],
+                "보관 조건": r["storage"],
+                "가격 (용량/$)": r["prices"],
+                "상태": r["status"],
+            }
+            for r in results
+        ]
+    )
+    st.dataframe(display_df, use_container_width=True)
 
-        prog_bar = st.progress(0, text="시작 중...")
-        status_msg = st.empty()
+    # ---- 출력 Excel 구성 (헤더 행 포함) ----
+    header = ["CAS No.", "제품명 (Product Name)", "Cat. No.", "CAS No. (확인)",
+              "외관 (Appearance)", "보관 조건", "가격 (용량/$)"]
 
-        for i, cas in enumerate(cas_list):
-            status_msg.info(f"[{i + 1}/{len(cas_list)}] CAS **{cas}** 처리 중...")
-            result = process_cas(cas, session)
-            results.append(result)
-            prog_bar.progress(
-                (i + 1) / len(cas_list),
-                text=f"{i + 1}/{len(cas_list)} — {cas}: {result['status']}",
-            )
-            time.sleep(0.4)  # 서버 부하 방지
+    rows = []
+    for r in results:
+        rows.append([
+            r["input_cas"],
+            r["product_name"],
+            r["catalog_number"],
+            r["cas_number"],
+            r["appearance"],
+            r["storage"],
+            r["prices"],
+        ])
 
-        n_ok = sum(1 for r in results if r["status"] == "성공")
-        status_msg.success(f"완료! 성공 {n_ok} / 전체 {len(results)}개")
+    df_out = pd.DataFrame(rows, columns=header)
 
-        # ---- 결과 테이블 표시 ----
-        display_df = pd.DataFrame(
-            [
-                {
-                    "입력 CAS": r["input_cas"],
-                    "제품명 (B)": r["product_name"],
-                    "카탈로그 번호 (C)": r["catalog_number"],
-                    "CAS 번호 (D)": r["cas_number"],
-                    "외관 (E)": r["appearance"],
-                    "보관 조건 (F)": r["storage"],
-                    "가격 (G)": r["prices"],
-                    "상태": r["status"],
-                }
-                for r in results
-            ]
-        )
-        st.dataframe(display_df, use_container_width=True)
+    out_buf = BytesIO()
+    with pd.ExcelWriter(out_buf, engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, header=True)
+    out_buf.seek(0)
 
-        # ---- 출력 Excel 구성 ----
-        df_out = df_orig.copy()
-        # 열이 7개 미만이면 빈 열 추가 (A=0 ~ G=6)
-        while df_out.shape[1] < 7:
-            df_out[df_out.shape[1]] = ""
-
-        result_map = {r["input_cas"]: r for r in results}
-        for idx in row_indices:
-            cas_val = str(df_orig.iloc[idx, 0]).strip()
-            if cas_val not in result_map:
-                continue
-            r = result_map[cas_val]
-            df_out.iat[idx, 1] = r["product_name"]
-            df_out.iat[idx, 2] = r["catalog_number"]
-            df_out.iat[idx, 3] = r["cas_number"]
-            df_out.iat[idx, 4] = r["appearance"]
-            df_out.iat[idx, 5] = r["storage"]
-            df_out.iat[idx, 6] = r["prices"]
-
-        out_buf = BytesIO()
-        with pd.ExcelWriter(out_buf, engine="openpyxl") as writer:
-            df_out.to_excel(writer, index=False, header=False)
-        out_buf.seek(0)
-
-        st.download_button(
-            label="📥 결과 Excel 다운로드",
-            data=out_buf.getvalue(),
-            file_name="bld_msds_results.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument"
-                ".spreadsheetml.sheet"
-            ),
-        )
+    st.download_button(
+        label="📥 결과 Excel 다운로드",
+        data=out_buf.getvalue(),
+        file_name="bld_msds_results.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument"
+            ".spreadsheetml.sheet"
+        ),
+    )
