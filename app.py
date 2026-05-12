@@ -488,99 +488,204 @@ def search_bld_pharm(cas: str, session: requests.Session) -> dict:
 
 
 # ===========================================================================
-# VENDOR: Alfa Aesar
+# VENDOR: Alfa Aesar  (via ThermoFisher typeahead — Alfa Aesar products now
+#                      on thermofisher.com after acquisition)
 # ===========================================================================
-
-def _alfa_find_sds_url(cat_no: str, prod_html: str, session: requests.Session):
-    """Try several strategies to find the Alfa Aesar SDS PDF URL."""
-    for pat in [
-        r'href="([^"]*(?:sds|msds|SDS|MSDS)[^"]*\.pdf[^"]*)"',
-        r"href='([^']*(?:sds|msds|SDS|MSDS)[^']*\.pdf[^']*)'",
-    ]:
-        m = re.search(pat, prod_html)
-        if m:
-            href = m.group(1)
-            return href if href.startswith("http") else f"https://www.alfa.com{href}"
-
-    candidates = [
-        f"https://www.alfa.com/content/uploads/msds/{cat_no}-MSDS.pdf",
-        f"https://www.alfa.com/content/uploads/sds/{cat_no}-SDS.pdf",
-    ]
-    for url in candidates:
-        try:
-            r = session.head(url, timeout=8, allow_redirects=True)
-            if r.status_code == 200 and "pdf" in r.headers.get("content-type", "").lower():
-                return url
-        except Exception:
-            pass
-    return None
-
 
 def search_alfa_aesar(cas: str, session: requests.Session) -> dict:
     result = _make_base_result("Alfa Aesar", cas)
     try:
-        # 1. Search
+        # 1. Typeahead search returns CAS-matched products from US IP
         r = session.get(
-            f"https://www.alfa.com/en/catalog/search/?q={quote(cas)}",
+            "https://www.thermofisher.com/search/service/typeaheadSuggestions"
+            f"?query={quote(cas)}&countryCode=US&langCode=en",
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return result
+
+        data = r.json()
+        hits = data.get("casNumber") or data.get("products") or []
+        if not hits:
+            return result  # not found → fall through to TCI
+
+        # Extract product URL from first hit
+        first_hit = hits[0] if isinstance(hits, list) else {}
+        if isinstance(first_hit, str):
+            prod_path = first_hit
+        else:
+            prod_path = (
+                first_hit.get("url")
+                or first_hit.get("link")
+                or first_hit.get("href")
+                or ""
+            )
+
+        if not prod_path:
+            return result
+
+        prod_url = (
+            prod_path if prod_path.startswith("http")
+            else f"https://www.thermofisher.com{prod_path}"
+        )
+
+        # 2. Fetch product page
+        r2 = session.get(prod_url, timeout=15)
+        if r2.status_code != 200:
+            return result
+
+        prod_html = r2.text
+        product_name = ""
+        cat_no = ""
+
+        # JSON-LD structured data (most reliable when present)
+        for ld_m in re.finditer(
+            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+            prod_html,
+            re.DOTALL | re.IGNORECASE,
+        ):
+            try:
+                ld = json.loads(ld_m.group(1))
+                if isinstance(ld, list):
+                    ld = ld[0]
+                if isinstance(ld, dict):
+                    name = ld.get("name", "")
+                    sku = ld.get("sku") or ld.get("productID") or ""
+                    if name and len(name) > 3:
+                        product_name = product_name or name
+                    if sku:
+                        cat_no = cat_no or str(sku)
+            except Exception:
+                pass
+
+        # H1 fallback for product name
+        if not product_name:
+            m = re.search(r"<h1[^>]*>([^<]{5,200})</h1>", prod_html)
+            if m:
+                product_name = _clean_html(m.group(1)).strip()
+
+        # Catalog number from URL when not found in page data
+        if not cat_no:
+            m = re.search(r"/catalog/product/([A-Za-z0-9-]+)", prod_url)
+            if m:
+                cat_no = m.group(1)
+
+        prices = _extract_gram_prices_from_html(prod_html)
+        appearance = ""
+        storage = ""
+
+        # 3. SDS PDF — look for explicit PDF link in page
+        sds_m = re.search(
+            r'href="([^"]*(?:sds|msds)[^"]*\.pdf[^"]*)"', prod_html, re.IGNORECASE
+        )
+        if sds_m:
+            sds_href = sds_m.group(1)
+            sds_url = (
+                sds_href if sds_href.startswith("http")
+                else f"https://www.thermofisher.com{sds_href}"
+            )
+            fields = _download_and_parse_pdf(sds_url, session)
+            if fields:
+                appearance = fields.get("appearance", "")
+                storage = fields.get("storage", "")
+                product_name = fields.get("product_name") or product_name
+
+        if not product_name:
+            return result
+
+        result.update(
+            {
+                "product_name": product_name,
+                "catalog_number": cat_no or cas,
+                "appearance": appearance,
+                "storage": storage,
+                "prices": prices,
+                "status": "성공" if product_name else "SDS 없음",
+            }
+        )
+    except Exception:
+        result["status"] = "오류"
+
+    return result
+
+# ===========================================================================
+# VENDOR: TCI Chemicals  (via sejinci.co.kr — Korean TCI distributor)
+# ===========================================================================
+
+
+def _sejinci_parse_prices(html: str) -> str:
+    """Parse sejinci.co.kr opt_lst table for KRW pricing."""
+    entries = []
+    # Each row has data-th="포장단위" for size and data-th="단가(원)" for unit price
+    for row in re.findall(r"<tr[^>]*class=\"m_chk\"[^>]*>.*?</tr>", html, re.DOTALL | re.IGNORECASE):
+        size_m = re.search(r'data-th="포장단위"[^>]*>\s*<div[^>]*>\s*([^<\s][^<]*?)\s*</div>', row, re.IGNORECASE | re.DOTALL)
+        price_m = re.search(r'data-th="단가\(원\)"[^>]*>\s*<div[^>]*>\s*([\d,]+)\s*</div>', row, re.IGNORECASE | re.DOTALL)
+        if size_m and price_m:
+            size_label = size_m.group(1).strip()
+            price_str = price_m.group(1).replace(",", "").strip()
+            if size_label and price_str:
+                entries.append((size_label, int(price_str)))
+    return ", ".join(f"{sz}/₩{pr:,}" for sz, pr in entries[:8])
+
+
+def search_tci(cas: str, session: requests.Session) -> dict:
+    result = _make_base_result("TCI", cas)
+    try:
+        # 1. Search via sejinci.co.kr (Korean TCI distributor — server-renders results)
+        r = session.get(
+            f"https://www.sejinci.co.kr/productsearch/?keyword={quote(cas)}",
             timeout=15,
         )
         if r.status_code != 200:
             return result
 
         html = r.text
-        # Catalog numbers: 1-2 uppercase letters + 4-6 digits
-        cat_matches = re.findall(r'/en/catalog/([A-Z]{1,2}\d{4,6})/', html)
-        if not cat_matches:
+
+        # Not found indicator
+        if "해당하는 제품이 검색되지 않았습니다" in html or "검색 결과가 없습니다" in html:
             return result
 
-        cat_no = cat_matches[0]
-
-        # 2. Product page
-        r2 = session.get(f"https://www.alfa.com/en/catalog/{cat_no}/", timeout=15)
-        if r2.status_code != 200:
-            return result
-
-        prod_html = r2.text
-
+        # 2. Parse product info from server-rendered HTML
         product_name = ""
-        for pat in [
-            r'<h1[^>]*class="[^"]*product[^"]*"[^>]*>([^<]+)</h1>',
-            r'<h1[^>]*>([^<]{5,200})</h1>',
-        ]:
-            m = re.search(pat, prod_html, re.IGNORECASE)
-            if m:
-                product_name = _clean_html(m.group(1)).strip()
-                break
+        m = re.search(r'<p class="name">\s*([^<]+)\s*</p>', html, re.IGNORECASE)
+        if m:
+            product_name = _clean_html(m.group(1)).strip()
 
-        prices = _extract_gram_prices_from_html(prod_html)
+        if not product_name:
+            return result
 
-        appearance = ""
-        for pat in [
-            r'Appearance[^:]*:\s*</[^>]+>\s*<[^>]+>([^<]{3,80})',
-            r'Appearance[^:]*:\s*([A-Za-z][^\n<]{2,80})(?:\s*<|\s*\n)',
-        ]:
-            m = re.search(pat, prod_html, re.IGNORECASE)
-            if m:
-                val = _clean_html(m.group(1)).strip()
-                if val.lower() not in ("n/a", "no data available", ""):
-                    appearance = val
-                    break
+        prod_code = ""
+        m = re.search(r'<th>\s*제품번호\s*</th>\s*<td[^>]*>(?:<[^>]+>)?([A-Z]\d{4,5})(?:</[^>]+>)?</td>',
+                      html, re.IGNORECASE | re.DOTALL)
+        if not m:
+            m = re.search(r'<th>\s*제품번호\s*</th>\s*<td[^>]*>\s*([A-Z]\d{4,5})\s*</td>',
+                          html, re.IGNORECASE | re.DOTALL)
+        if m:
+            prod_code = m.group(1).strip()
 
+        cas_found = ""
+        m = re.search(r'<th>\s*CAS\s*NO\s*</th>\s*<td[^>]*>\s*([^<\s][^<]*?)\s*</td>',
+                      html, re.IGNORECASE | re.DOTALL)
+        if m:
+            cas_found = _clean_html(m.group(1)).strip()
+
+        # Purity used as proxy for appearance when no SDS is available
+        purity = ""
+        m = re.search(r'<th>\s*순도/시험방법\s*</th>\s*<td[^>]*>\s*([^<]+)\s*</td>',
+                      html, re.IGNORECASE | re.DOTALL)
+        if m:
+            purity = _clean_html(m.group(1)).strip()
+
+        prices = _sejinci_parse_prices(html)
+        appearance = purity  # fallback; replaced by SDS data if available
         storage = ""
-        for pat in [
-            r'Storage[^:]*:\s*</[^>]+>\s*<[^>]+>([^<]{3,120})',
-            r'Storage[^:]*:\s*([^\n<]{5,120})(?:\s*<|\s*\n)',
-        ]:
-            m = re.search(pat, prod_html, re.IGNORECASE)
-            if m:
-                val = _clean_html(m.group(1)).strip()
-                if val and len(val) > 3:
-                    storage = _classify_storage(val)
-                    break
 
-        # 3. SDS PDF
-        sds_url = _alfa_find_sds_url(cat_no, prod_html, session)
-        if sds_url:
+        # 3. SDS PDF (tcichemicals.com KR — may work from Streamlit Cloud)
+        if prod_code:
+            sds_url = (
+                f"https://www.tcichemicals.com/KR/ko/documentSearch/productSDSSearchDoc"
+                f"?productCode={prod_code}&langSelector=ko&selectedCountry=KR"
+            )
             fields = _download_and_parse_pdf(sds_url, session)
             if fields:
                 if fields.get("appearance"):
@@ -593,136 +698,8 @@ def search_alfa_aesar(cas: str, session: requests.Session) -> dict:
         result.update(
             {
                 "product_name": product_name,
-                "catalog_number": cat_no,
-                "appearance": appearance,
-                "storage": storage,
-                "prices": prices,
-                "status": "성공" if product_name else "SDS 없음",
-            }
-        )
-    except Exception:
-        result["status"] = "오류"
-
-    return result
-
-
-# ===========================================================================
-# VENDOR: TCI Chemicals
-# ===========================================================================
-
-def _tci_build_prices(prod_html: str) -> str:
-    """Parse TCI product page for pricing information."""
-    entries = []
-
-    for row_html in re.findall(r"<tr[^>]*>.*?</tr>", prod_html, re.DOTALL | re.IGNORECASE):
-        cells = [
-            _clean_html(c)
-            for c in re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL | re.IGNORECASE)
-        ]
-        for i, cell in enumerate(cells):
-            gm = re.match(r"([\d.]+)\s*(mg|g|kg)", cell, re.IGNORECASE)
-            if gm and i + 1 < len(cells):
-                pm = re.search(r"\$([\d,.]+)", cells[i + 1])
-                if pm:
-                    try:
-                        qty = float(gm.group(1))
-                        unit = gm.group(2).lower()
-                        price = float(pm.group(1).replace(",", ""))
-                        qty_g = qty / 1000 if unit == "mg" else (qty * 1000 if unit == "kg" else qty)
-                        entries.append((qty_g, f"{gm.group(1)}{gm.group(2)}", price))
-                    except Exception:
-                        pass
-
-    if not entries:
-        return _extract_gram_prices_from_html(prod_html)
-
-    seen: set = set()
-    unique = []
-    for qty_g, label, price in sorted(entries):
-        if label not in seen:
-            seen.add(label)
-            unique.append((qty_g, label, price))
-    return ", ".join(f"{lb}/${pr:.0f}" for _, lb, pr in unique[:8])
-
-
-def search_tci(cas: str, session: requests.Session) -> dict:
-    result = _make_base_result("TCI", cas)
-    try:
-        # 1. Search
-        r = session.get(
-            f"https://www.tcichemicals.com/US/en/c/search?text={quote(cas)}",
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return result
-
-        html = r.text
-        prod_matches = re.findall(r"/US/en/p/([A-Z]\d{4,5})\b", html)
-        if not prod_matches:
-            prod_matches = re.findall(r'"productCode"\s*:\s*"([A-Z]\d{4,5})"', html)
-        if not prod_matches:
-            return result
-
-        prod_code = prod_matches[0]
-
-        # 2. Product page
-        r2 = session.get(
-            f"https://www.tcichemicals.com/US/en/p/{prod_code}", timeout=15
-        )
-        if r2.status_code != 200:
-            return result
-
-        prod_html = r2.text
-
-        product_name = ""
-        m = re.search(r"<h1[^>]*>([^<]{5,200})</h1>", prod_html)
-        if m:
-            product_name = _clean_html(m.group(1)).strip()
-
-        prices = _tci_build_prices(prod_html)
-
-        appearance = ""
-        for pat in [
-            r"Appearance[^:]*:\s*</[^>]+>\s*<[^>]+>([^<]{3,80})",
-            r"Appearance[^:]*:\s*([A-Za-z][^\n<]{2,80})",
-        ]:
-            m = re.search(pat, prod_html, re.IGNORECASE)
-            if m:
-                val = _clean_html(m.group(1)).strip()
-                if val.lower() not in ("n/a", "no data available", ""):
-                    appearance = val
-                    break
-
-        storage = ""
-        for pat in [
-            r"Storage[^:]*:\s*</[^>]+>\s*<[^>]+>([^<]{3,120})",
-            r"Storage[^:]*:\s*([^\n<]{5,120})",
-        ]:
-            m = re.search(pat, prod_html, re.IGNORECASE)
-            if m:
-                val = _clean_html(m.group(1)).strip()
-                if val and len(val) > 3:
-                    storage = _classify_storage(val)
-                    break
-
-        # 3. SDS PDF
-        tci_sds_url = (
-            f"https://www.tcichemicals.com/US/en/c/downloadPDFSDS"
-            f"?lang=en&productCode={prod_code}&countryCode=US"
-        )
-        fields = _download_and_parse_pdf(tci_sds_url, session)
-        if fields:
-            if fields.get("appearance"):
-                appearance = fields["appearance"]
-            if fields.get("storage"):
-                storage = fields["storage"]
-            if fields.get("product_name") and not product_name:
-                product_name = fields["product_name"]
-
-        result.update(
-            {
-                "product_name": product_name,
-                "catalog_number": prod_code,
+                "catalog_number": prod_code or cas,
+                "cas_number": cas_found or cas,
                 "appearance": appearance,
                 "storage": storage,
                 "prices": prices,
@@ -852,53 +829,39 @@ def _sigma_specs_from_html(html: str):
 def search_sigma_aldrich(cas: str, session: requests.Session) -> dict:
     result = _make_base_result("Sigma-Aldrich", cas)
     try:
-        # 1. REST search API
+        # 1. Warm up for Akamai locale cookies (non-fatal if geo-blocked)
+        try:
+            session.get("https://www.sigmaaldrich.com/US/en/", timeout=10)
+        except Exception:
+            pass
+
+        # 2. GraphQL POST search by CAS number
         product_info: dict = {}
-        r = session.get(
-            f"https://www.sigmaaldrich.com/api/2022/products/search"
-            f"?q={quote(cas)}&region=US&language=en"
-            f"&sort=relevance&brand=sigmaaldrich&perpage=5&page=1",
-            headers={"Accept": "application/json"},
+        gql_query = (
+            '{ getProductSearchResults(input: {searchTerm: "'
+            + cas.replace('"', "")
+            + '", type: CAS_NUMBER}) { items { ... on Product {'
+            + " productNumber brand { key name } productName casNumber"
+            + " } } } }"
+        )
+        r = session.post(
+            "https://www.sigmaaldrich.com/api/2022/products/search",
+            json={"query": gql_query},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
             timeout=15,
         )
         if r.status_code == 200:
             try:
                 data = r.json()
-                for key in ("results", "products", "items"):
-                    items = data.get(key, [])
-                    if isinstance(items, list) and items:
-                        product_info = items[0]
-                        break
+                items = (
+                    data.get("data", {})
+                    .get("getProductSearchResults", {})
+                    .get("items", [])
+                )
+                if isinstance(items, list) and items:
+                    product_info = items[0]
             except Exception:
                 pass
-
-        # 2. HTML __NEXT_DATA__ fallback
-        if not product_info:
-            r2 = session.get(
-                f"https://www.sigmaaldrich.com/US/en/search/{quote(cas)}"
-                f"?focus=product&page=1&perpage=30&sort=relevance"
-                f"&term={quote(cas)}&type=cas_number",
-                timeout=15,
-            )
-            if r2.status_code == 200:
-                next_data = _sigma_extract_next_data(r2.text)
-                try:
-                    props = next_data.get("props", {}).get("pageProps", {})
-                    for key in ("results", "searchResults", "products"):
-                        val = props.get(key)
-                        if isinstance(val, list) and val:
-                            product_info = val[0]
-                            break
-                        if isinstance(val, dict):
-                            for sub_key in ("items", "products", "results"):
-                                sub = val.get(sub_key, [])
-                                if isinstance(sub, list) and sub:
-                                    product_info = sub[0]
-                                    break
-                        if product_info:
-                            break
-                except Exception:
-                    pass
 
         if not product_info:
             return result
@@ -912,8 +875,8 @@ def search_sigma_aldrich(cas: str, session: requests.Session) -> dict:
             or ""
         )
         product_name = (
-            product_info.get("name")
-            or product_info.get("productName")
+            product_info.get("productName")
+            or product_info.get("name")
             or product_info.get("title")
             or ""
         )
