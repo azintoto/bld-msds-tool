@@ -89,6 +89,9 @@ def _clean_html(text: str) -> str:
         .replace("&nbsp;", " ")
         .replace("&#176;", "°")
         .replace("&deg;", "°")
+        .replace("&trade;", "™")
+        .replace("&reg;", "®")
+        .replace("&copy;", "©")
     )
     return re.sub(r"\s+", " ", text).strip()
 
@@ -123,12 +126,14 @@ def _classify_storage(raw: str) -> str:
     freeze_patterns = [
         r"-\s*20\s*[°℃c]", r"-\s*80\s*[°℃c]", r"-\s*70\s*[°℃c]",
         r"below\s*0", r"freezer", r"frozen", r"\bfreeze\b",
+        r"냉동", r"영하",  # Korean freeze terms
     ]
     is_freeze = any(re.search(p, t) for p in freeze_patterns)
 
     fridge_patterns = [
         r"2\s*[-~]\s*8\s*[°℃c]", r"4\s*[°℃c]", r"0\s*[-~]\s*5\s*[°℃c]",
         r"refrigerat", r"\bcool\b", r"\bcold\b", r"cold.chain",
+        r"냉장", r"저온",  # Korean refrigeration terms
     ]
     is_fridge = any(re.search(p, t) for p in fridge_patterns)
 
@@ -200,6 +205,8 @@ def _extract_sds_fields(raw_text: str) -> dict:
         r"Colour\s+([^\n]+)",
         r"Color\s+([^\n]+)",
         r"Appearance\s*[:\s]+([^\n<]{3,80})",
+        # Korean TF SDS: "외관(물리적 상태, 색 등) 무색 액체" - value on same line after closing paren
+        r"외+관+\s*\([^\)\n]*\)\s+(\S[^\n]{2,60})",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
@@ -214,6 +221,8 @@ def _extract_sds_fields(raw_text: str) -> dict:
         r"Storage[^\n]*conditions[^\n]*[:\s]+([^\n]{5,150})",
         r"Recommended storage[^\n]*[:\s]+([^\n]{5,100})",
         r"Storage temperature[^\n]*[:\s]+([^\n]{3,60})",
+        # Korean TF SDS: "안전한 저장 방법: ...\n[conditions]" (headers may have 2× char artifacts)
+        r"안+전+한+\s*저+장+\s*방+법+[^\n]*\n(.+?)(?=\n최+종+|\n\d+\.)",
     ]:
         m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
         if m:
@@ -540,11 +549,32 @@ def search_alfa_aesar(cas: str, session: requests.Session) -> dict:
         if not product_name:
             return result
 
+        # Fetch SDS PDF for appearance and storage
+        appearance = ""
+        storage = ""
+        if prod_code:
+            try:
+                r_sds = session.get(
+                    "https://chemicals.thermofisher.kr/apac/api/document/search/sds"
+                    f"?childSkus={prod_code}&language=ko",
+                    timeout=10,
+                )
+                sds_url = r_sds.json().get("data", "")
+                if sds_url:
+                    fields = _download_and_parse_pdf(sds_url, session)
+                    if fields:
+                        appearance = fields.get("appearance", "")
+                        storage = fields.get("storage", "")
+            except Exception:
+                pass
+
         result.update(
             {
                 "product_name": product_name,
                 "catalog_number": prod_code or cas,
                 "cas_number": cas_found,
+                "appearance": appearance,
+                "storage": storage,
                 "status": "성공",
             }
         )
