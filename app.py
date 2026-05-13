@@ -493,102 +493,49 @@ def search_bld_pharm(cas: str, session: requests.Session) -> dict:
 # ===========================================================================
 
 def search_alfa_aesar(cas: str, session: requests.Session) -> dict:
+    """Search via chemicals.thermofisher.kr (Alfa Aesar KR chemicals portal)."""
     result = _make_base_result("Alfa Aesar", cas)
     try:
-        # 1. Typeahead search returns CAS-matched products from US IP
-        r = session.get(
-            "https://www.thermofisher.com/search/service/typeaheadSuggestions"
-            f"?query={quote(cas)}&countryCode=US&langCode=en",
+        # POST to the internal Next.js search API
+        r = session.post(
+            "https://chemicals.thermofisher.kr/apac/api/search/catalog/keyword",
+            json={
+                "countryCode": "kr",
+                "language": "ko",
+                "filter": "",
+                "pageNo": 1,
+                "pageSize": 10,
+                "persona": "catalog",
+                "query": cas,
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Referer": "https://chemicals.thermofisher.kr/kr/ko/home.html",
+            },
             timeout=15,
         )
         if r.status_code != 200:
             return result
 
         data = r.json()
-        hits = data.get("casNumber") or data.get("products") or []
-        if not hits:
-            return result  # not found → fall through to TCI
-
-        # Extract product URL from first hit
-        first_hit = hits[0] if isinstance(hits, list) else {}
-        if isinstance(first_hit, str):
-            prod_path = first_hit
-        else:
-            prod_path = (
-                first_hit.get("url")
-                or first_hit.get("link")
-                or first_hit.get("href")
-                or ""
-            )
-
-        if not prod_path:
+        if data.get("code") != "200":
             return result
 
-        prod_url = (
-            prod_path if prod_path.startswith("http")
-            else f"https://www.thermofisher.com{prod_path}"
-        )
-
-        # 2. Fetch product page
-        r2 = session.get(prod_url, timeout=15)
-        if r2.status_code != 200:
+        items = data.get("data", {}).get("catalogResultDTOs", [])
+        if not items:
             return result
 
-        prod_html = r2.text
-        product_name = ""
-        cat_no = ""
+        # Prefer items whose cas field exactly matches the query
+        cas_items = [i for i in items if i.get("cas") == cas]
+        product = (cas_items or items)[0]
 
-        # JSON-LD structured data (most reliable when present)
-        for ld_m in re.finditer(
-            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-            prod_html,
-            re.DOTALL | re.IGNORECASE,
-        ):
-            try:
-                ld = json.loads(ld_m.group(1))
-                if isinstance(ld, list):
-                    ld = ld[0]
-                if isinstance(ld, dict):
-                    name = ld.get("name", "")
-                    sku = ld.get("sku") or ld.get("productID") or ""
-                    if name and len(name) > 3:
-                        product_name = product_name or name
-                    if sku:
-                        cat_no = cat_no or str(sku)
-            except Exception:
-                pass
-
-        # H1 fallback for product name
-        if not product_name:
-            m = re.search(r"<h1[^>]*>([^<]{5,200})</h1>", prod_html)
-            if m:
-                product_name = _clean_html(m.group(1)).strip()
-
-        # Catalog number from URL when not found in page data
-        if not cat_no:
-            m = re.search(r"/catalog/product/([A-Za-z0-9-]+)", prod_url)
-            if m:
-                cat_no = m.group(1)
-
-        prices = _extract_gram_prices_from_html(prod_html)
-        appearance = ""
-        storage = ""
-
-        # 3. SDS PDF — look for explicit PDF link in page
-        sds_m = re.search(
-            r'href="([^"]*(?:sds|msds)[^"]*\.pdf[^"]*)"', prod_html, re.IGNORECASE
+        product_name = _clean_html(product.get("catalogName") or "")
+        prod_code = (
+            product.get("childCatalogNumber")
+            or product.get("rootCatalogNumber")
+            or ""
         )
-        if sds_m:
-            sds_href = sds_m.group(1)
-            sds_url = (
-                sds_href if sds_href.startswith("http")
-                else f"https://www.thermofisher.com{sds_href}"
-            )
-            fields = _download_and_parse_pdf(sds_url, session)
-            if fields:
-                appearance = fields.get("appearance", "")
-                storage = fields.get("storage", "")
-                product_name = fields.get("product_name") or product_name
+        cas_found = product.get("cas") or cas
 
         if not product_name:
             return result
@@ -596,11 +543,9 @@ def search_alfa_aesar(cas: str, session: requests.Session) -> dict:
         result.update(
             {
                 "product_name": product_name,
-                "catalog_number": cat_no or cas,
-                "appearance": appearance,
-                "storage": storage,
-                "prices": prices,
-                "status": "성공" if product_name else "SDS 없음",
+                "catalog_number": prod_code or cas,
+                "cas_number": cas_found,
+                "status": "성공",
             }
         )
     except Exception:
@@ -841,7 +786,7 @@ def search_sigma_aldrich(cas: str, session: requests.Session) -> dict:
             '{ getProductSearchResults(input: {searchTerm: "'
             + cas.replace('"', "")
             + '", type: CAS_NUMBER}) { items { ... on Product {'
-            + " productNumber brand { key name } productName casNumber"
+            + " productNumber brand { key name } casNumber"
             + " } } } }"
         )
         r = session.post(
@@ -875,8 +820,7 @@ def search_sigma_aldrich(cas: str, session: requests.Session) -> dict:
             or ""
         )
         product_name = (
-            product_info.get("productName")
-            or product_info.get("name")
+            product_info.get("name")
             or product_info.get("title")
             or ""
         )
