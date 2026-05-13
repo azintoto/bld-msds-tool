@@ -588,6 +588,56 @@ def search_alfa_aesar(cas: str, session: requests.Session) -> dict:
 # ===========================================================================
 
 
+def _tci_code_from_pubchem(cas: str, session: requests.Session) -> str:
+    """
+    Fallback: Retrieve TCI product code via PubChem cross-reference.
+
+    Resolves CAS → PubChem CID → RegistryIDs, then verifies each candidate
+    5-char code (letter + 4 digits) belongs to source "TCI (Tokyo Chemical
+    Industry)" in PubChem.  Uses NIH public API — no geo-restrictions, no
+    bot protection.
+
+    Returns product code (e.g. 'D5818') or '' if not found.
+    """
+    try:
+        r = session.get(
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{quote(cas)}/cids/JSON",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return ""
+        cids = r.json().get("IdentifierList", {}).get("CID", [])
+        if not cids:
+            return ""
+        cid = cids[0]
+
+        r2 = session.get(
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/xrefs/RegistryID/JSON",
+            timeout=10,
+        )
+        if r2.status_code != 200:
+            return ""
+        info_list = r2.json().get("InformationList", {}).get("Information", [])
+        reg_ids = info_list[0].get("RegistryID", []) if info_list else []
+
+        for rid in reg_ids:
+            if not re.match(r"^[A-Z]\d{4}$", rid):
+                continue
+            r3 = session.get(
+                f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/substance/name/{rid}/JSON",
+                timeout=10,
+            )
+            if r3.status_code != 200:
+                continue
+            for sub in r3.json().get("PC_Substances", []):
+                db = sub.get("source", {}).get("db", {})
+                if "TCI" in db.get("name", "") and db.get("source_id", {}).get("str", "") == rid:
+                    return rid
+    except Exception:
+        pass
+    return ""
+
+
 def _sejinci_parse_prices(html: str) -> str:
     """Parse sejinci.co.kr opt_lst table for KRW pricing."""
     entries = []
@@ -606,56 +656,68 @@ def _sejinci_parse_prices(html: str) -> str:
 def search_tci(cas: str, session: requests.Session) -> dict:
     result = _make_base_result("TCI", cas)
     try:
-        # 1. Search via sejinci.co.kr (Korean TCI distributor — server-renders results)
-        r = session.get(
-            f"https://www.sejinci.co.kr/productsearch/?keyword={quote(cas)}",
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return result
-
-        html = r.text
-
-        # Not found indicator
-        if "해당하는 제품이 검색되지 않았습니다" in html or "검색 결과가 없습니다" in html:
-            return result
-
-        # 2. Parse product info from server-rendered HTML
         product_name = ""
-        m = re.search(r'<p class="name">\s*([^<]+)\s*</p>', html, re.IGNORECASE)
-        if m:
-            product_name = _clean_html(m.group(1)).strip()
-
-        if not product_name:
-            return result
-
         prod_code = ""
-        m = re.search(r'<th>\s*제품번호\s*</th>\s*<td[^>]*>(?:<[^>]+>)?([A-Z]\d{4,5})(?:</[^>]+>)?</td>',
-                      html, re.IGNORECASE | re.DOTALL)
-        if not m:
-            m = re.search(r'<th>\s*제품번호\s*</th>\s*<td[^>]*>\s*([A-Z]\d{4,5})\s*</td>',
-                          html, re.IGNORECASE | re.DOTALL)
-        if m:
-            prod_code = m.group(1).strip()
-
         cas_found = ""
-        m = re.search(r'<th>\s*CAS\s*NO\s*</th>\s*<td[^>]*>\s*([^<\s][^<]*?)\s*</td>',
-                      html, re.IGNORECASE | re.DOTALL)
-        if m:
-            cas_found = _clean_html(m.group(1)).strip()
-
-        # Purity used as proxy for appearance when no SDS is available
         purity = ""
-        m = re.search(r'<th>\s*순도/시험방법\s*</th>\s*<td[^>]*>\s*([^<]+)\s*</td>',
-                      html, re.IGNORECASE | re.DOTALL)
-        if m:
-            purity = _clean_html(m.group(1)).strip()
+        prices = ""
 
-        prices = _sejinci_parse_prices(html)
+        # 1. Primary: sejinci.co.kr (Korean TCI distributor — server-renders results)
+        try:
+            r = session.get(
+                f"https://www.sejinci.co.kr/productsearch/?keyword={quote(cas)}",
+                timeout=15,
+            )
+            if r.status_code == 200:
+                html = r.text
+                if ("해당하는 제품이 검색되지 않았습니다" not in html
+                        and "검색 결과가 없습니다" not in html):
+                    m = re.search(r'<p class="name">\s*([^<]+)\s*</p>', html, re.IGNORECASE)
+                    if m:
+                        product_name = _clean_html(m.group(1)).strip()
+
+                    if product_name:
+                        m = re.search(
+                            r'<th>\s*제품번호\s*</th>\s*<td[^>]*>(?:<[^>]+>)?([A-Z]\d{4,5})(?:</[^>]+>)?</td>',
+                            html, re.IGNORECASE | re.DOTALL,
+                        )
+                        if not m:
+                            m = re.search(
+                                r'<th>\s*제품번호\s*</th>\s*<td[^>]*>\s*([A-Z]\d{4,5})\s*</td>',
+                                html, re.IGNORECASE | re.DOTALL,
+                            )
+                        if m:
+                            prod_code = m.group(1).strip()
+
+                        m = re.search(
+                            r'<th>\s*CAS\s*NO\s*</th>\s*<td[^>]*>\s*([^<\s][^<]*?)\s*</td>',
+                            html, re.IGNORECASE | re.DOTALL,
+                        )
+                        if m:
+                            cas_found = _clean_html(m.group(1)).strip()
+
+                        m = re.search(
+                            r'<th>\s*순도/시험방법\s*</th>\s*<td[^>]*>\s*([^<]+)\s*</td>',
+                            html, re.IGNORECASE | re.DOTALL,
+                        )
+                        if m:
+                            purity = _clean_html(m.group(1)).strip()
+
+                        prices = _sejinci_parse_prices(html)
+        except Exception:
+            pass  # sejinci failed; fall through to PubChem
+
+        # 2. Fallback: PubChem TCI cross-reference (geo-unrestricted NIH API)
+        #    Used when sejinci is unreachable or returns no product from non-KR IP.
+        if not product_name:
+            prod_code = _tci_code_from_pubchem(cas, session)
+            if not prod_code:
+                return result  # TCI genuinely has no product for this CAS
+
         appearance = purity  # fallback; replaced by SDS data if available
         storage = ""
 
-        # 3. SDS PDF (tcichemicals.com KR — may work from Streamlit Cloud)
+        # 3. SDS PDF (tcichemicals.com KR)
         if prod_code:
             sds_url = (
                 f"https://www.tcichemicals.com/KR/ko/documentSearch/productSDSSearchDoc"
@@ -672,13 +734,13 @@ def search_tci(cas: str, session: requests.Session) -> dict:
 
         result.update(
             {
-                "product_name": product_name,
+                "product_name": product_name or prod_code,
                 "catalog_number": prod_code or cas,
                 "cas_number": cas_found or cas,
                 "appearance": appearance,
                 "storage": storage,
                 "prices": prices,
-                "status": "성공" if product_name else "SDS 없음",
+                "status": "성공",
             }
         )
     except Exception:
