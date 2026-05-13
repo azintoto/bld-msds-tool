@@ -588,16 +588,17 @@ def search_alfa_aesar(cas: str, session: requests.Session) -> dict:
 # ===========================================================================
 
 
-def _tci_code_from_pubchem(cas: str, session: requests.Session) -> str:
+def _tci_code_from_pubchem(cas: str, session: requests.Session) -> tuple:
     """
-    Fallback: Retrieve TCI product code via PubChem cross-reference.
+    Fallback: Retrieve TCI product code and compound name via PubChem.
 
     Resolves CAS → PubChem CID → RegistryIDs, then verifies each candidate
     5-char code (letter + 4 digits) belongs to source "TCI (Tokyo Chemical
     Industry)" in PubChem.  Uses NIH public API — no geo-restrictions, no
     bot protection.
 
-    Returns product code (e.g. 'D5818') or '' if not found.
+    Returns (product_code, compound_name) tuple, e.g. ('D5818', 'Dihydroxyacetone'),
+    or ('', '') if not found.
     """
     try:
         r = session.get(
@@ -605,10 +606,10 @@ def _tci_code_from_pubchem(cas: str, session: requests.Session) -> str:
             timeout=10,
         )
         if r.status_code != 200:
-            return ""
+            return "", ""
         cids = r.json().get("IdentifierList", {}).get("CID", [])
         if not cids:
-            return ""
+            return "", ""
         cid = cids[0]
 
         r2 = session.get(
@@ -616,7 +617,7 @@ def _tci_code_from_pubchem(cas: str, session: requests.Session) -> str:
             timeout=10,
         )
         if r2.status_code != 200:
-            return ""
+            return "", ""
         info_list = r2.json().get("InformationList", {}).get("Information", [])
         reg_ids = info_list[0].get("RegistryID", []) if info_list else []
 
@@ -632,10 +633,22 @@ def _tci_code_from_pubchem(cas: str, session: requests.Session) -> str:
             for sub in r3.json().get("PC_Substances", []):
                 db = sub.get("source", {}).get("db", {})
                 if "TCI" in db.get("name", "") and db.get("source_id", {}).get("str", "") == rid:
-                    return rid
+                    # Also fetch the preferred compound name from PubChem
+                    compound_name = ""
+                    try:
+                        rn = session.get(
+                            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/Title/JSON",
+                            timeout=10,
+                        )
+                        if rn.status_code == 200:
+                            props = rn.json().get("PropertyTable", {}).get("Properties", [{}])
+                            compound_name = props[0].get("Title", "") if props else ""
+                    except Exception:
+                        pass
+                    return rid, compound_name
     except Exception:
         pass
-    return ""
+    return "", ""
 
 
 def _sejinci_parse_prices(html: str) -> str:
@@ -710,9 +723,10 @@ def search_tci(cas: str, session: requests.Session) -> dict:
         # 2. Fallback: PubChem TCI cross-reference (geo-unrestricted NIH API)
         #    Used when sejinci is unreachable or returns no product from non-KR IP.
         if not product_name:
-            prod_code = _tci_code_from_pubchem(cas, session)
+            prod_code, pubchem_name = _tci_code_from_pubchem(cas, session)
             if not prod_code:
                 return result  # TCI genuinely has no product for this CAS
+            product_name = pubchem_name  # use PubChem compound name as fallback
 
         appearance = purity  # fallback; replaced by SDS data if available
         storage = ""
@@ -734,7 +748,7 @@ def search_tci(cas: str, session: requests.Session) -> dict:
 
         result.update(
             {
-                "product_name": product_name or prod_code,
+                "product_name": product_name,
                 "catalog_number": prod_code or cas,
                 "cas_number": cas_found or cas,
                 "appearance": appearance,
